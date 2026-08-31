@@ -1,0 +1,133 @@
+# As variáveis da aplicação vêm do .env do projeto, lido pelo próprio Laravel.
+#
+# Não declare DB_*/CACHE_*/QUEUE_* no bloco "environment" dos serviços PHP: uma
+# variável de ambiente real sobrepõe o phpunit.xml e os testes acabariam
+# rodando contra o banco de desenvolvimento.
+services:
+  # Painel + API (servidor HTTP simples; o Octane atende as tarefas paralelas).
+  app:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+      target: base
+    container_name: schedule_service_app
+    environment:
+      RUN_MIGRATIONS: "true"
+    volumes:
+      - .:/var/www/html
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${APP_PORT:-8095}:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # Servidor Octane (Swoole). Os task workers daqui executam as tarefas
+  # marcadas como "paralelo" — várias ao mesmo tempo, sem passar por fila.
+  octane:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+      target: octane
+    container_name: schedule_service_octane
+    command: >
+      php artisan octane:start --server=swoole --host=0.0.0.0 --port=8000
+      --workers=${OCTANE_WORKERS:-4} --task-workers=${OCTANE_TASK_WORKERS:-16}
+    volumes:
+      - .:/var/www/html
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${OCTANE_PORT:-8096}:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # Relógio do agendador: a cada minuto chama tasks:dispatch-due.
+  scheduler:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+      target: base
+    container_name: schedule_service_scheduler
+    command: php artisan schedule:work
+    volumes:
+      - .:/var/www/html
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # Fila sequencial: UM único processo, de propósito. É o que garante que as
+  # tarefas de um mesmo grupo rodem uma após a outra, nunca juntas.
+  worker-sequential:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+      target: base
+    container_name: schedule_service_worker_sequential
+    command: php artisan queue:work redis --queue=sequential --tries=1 --timeout=960 --sleep=1
+    volumes:
+      - .:/var/www/html
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # Fila paralela: fallback de quando o Octane está indisponível. Pode escalar
+  # à vontade (docker compose up -d --scale worker-parallel=4).
+  worker-parallel:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+      target: base
+    command: php artisan queue:work redis --queue=parallel,default --tries=1 --timeout=960 --sleep=1
+    volumes:
+      - .:/var/www/html
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  mysql:
+    image: mysql:8.0
+    container_name: schedule_service_mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: ${DB_DATABASE:-schedule_service}
+      MYSQL_USER: ${DB_USERNAME:-schedule_service}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-secret}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "${DB_PORT_EXTERNAL:-3310}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p${DB_ROOT_PASSWORD:-root} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: schedule_service_redis
+    ports:
+      - "${REDIS_PORT_EXTERNAL:-6382}:6379"
+
+volumes:
+  mysql_data:
